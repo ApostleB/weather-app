@@ -59,7 +59,9 @@ weather-app/                 pnpm workspace
 
 - 발표시각 계산: 현재 시각에서 "제공 시각이 지난 가장 최근 발표"를 고른다(자정 이전 날짜로 넘어가는 경우 포함). 응답이 `03 NODATA_ERROR`면 직전 발표로 한 번 재시도한다.
 - 단기예보는 한 번에 받는다(`numOfRows=1000`).
-- 중기 발표시각 tmFc: 06시 이전이면 전날 18시, 18시 이전이면 당일 06시, 그 외 당일 18시. 06시 발표는 4일 후부터, 18시 발표는 5일 후부터 값이 있다.
+- 중기 발표시각 tmFc: 06:10 이전이면 전날 18시, 18:10 이전이면 당일 06시, 그 외 당일 18시(다른 API와 같이 10분 여유). 06시 발표는 4일 후부터, 18시 발표는 5일 후부터 값이 있다.
+- 단기예보 연장기간 판정은 날짜가 아니라 값 형식으로 한다: 그 시각의 PCP가 숫자 한 자리(`0`~`3`)면 정성 코드 구간이며, 이때 PCP·SNO·WSD를 코드표 문구로 바꾼다(실측: 14시 발표에서 +3일은 정량값, +4일부터 코드).
+- `daily`의 단기예보 날짜는 발표일과 TMN/TMX가 있는 날만 쓰고, 그 이후는 중기예보로 채운다. 발표일에 TMN/TMX가 없으면 남은 시간 TMP의 최저/최고로 대신한다.
 
 ### 위경도 ↔ 격자
 
@@ -81,8 +83,10 @@ weather-app/                 pnpm workspace
 ```ts
 {
   location: { lat: number; lon: number; nx: number; ny: number; name: string } // name: "서울특별시 종로구 사직동"
-  current: { observedAt: string; temp: number; humidity: number; rain1h: number; windSpeed: number; windDir: number; pty: number } | null
-  hourly: { time: string; temp: number; sky: number; pty: number; pop: number; pcp: string; humidity: number; windSpeed: number; windDir: number }[]
+  current: { observedAt: string; temp: number | null; humidity: number | null; rain1h: number | null; windSpeed: number | null; windDir: number | null; pty: number | null } | null
+  hourly: { time: string; temp: number | null; sky: number | null; pty: number | null; pop: number | null; humidity: number | null
+            windDir: number | null; windSpeed: number | null; windText: string | null; pcp: string | null; sno: string | null }[]
+            // 정성 코드 구간이면 windSpeed=null, windText="약한 바람" 등
   daily: { date: string; min: number | null; max: number | null; amWf: string | null; pmWf: string | null; amPop: number | null; pmPop: number | null }[]
   issued: { current?: string; hourly?: string; mid?: string } // 사용한 발표시각
   stale: boolean                      // 하나라도 만료된 캐시로 대신했으면 true
@@ -95,8 +99,8 @@ weather-app/                 pnpm workspace
 
 ### 캐시
 
-- 메모리 LRU(최대 5,000개). 키 `(API, nx/ny 또는 regId, 발표시각)`. 같은 키로 동시에 들어온 요청은 기상청 호출 하나를 공유한다.
-- 유효기간은 다음 발표의 제공 시각까지. 호출 실패 시 만료된 캐시가 있으면 그것을 쓰고 `stale: true`를 표시한다.
+- 메모리 LRU(최대 5,000개). 키 `(API, nx/ny 또는 regId)`, 값에 사용한 발표시각을 함께 저장한다. 같은 키로 동시에 들어온 요청은 기상청 호출 하나를 공유한다.
+- 유효기간은 다음 발표의 제공 시각까지(NODATA로 직전 발표를 썼으면 최소 5분 뒤 재시도). 호출 실패 시 만료된 캐시가 있으면 그것을 쓰고 `stale: true`를 표시한다.
 - 같은 격자는 발표당 1회만 호출하므로 하루 호출 한도(개발계정) 안에서 운영할 수 있다. 한도 초과(`22`)는 로그로 남긴다.
 
 ## 바람 지도
@@ -123,7 +127,8 @@ weather-app/                 pnpm workspace
 ### 프론트 바람 레이어
 
 - MapLibre GL + OpenFreeMap 배경 스타일(키 없음).
-- MapLibre custom layer(WebGL)로 입자 애니메이션을 그린다(mapbox/webgl-wind 방식: 입자 위치를 텍스처에 저장하고, 바람 PNG를 샘플링해 이동하고, 잔상을 페이드). 지도 이동·줌 중에는 입자를 초기화한다.
+- 지도 위 Canvas 2D 오버레이로 입자 애니메이션을 그린다: 입자는 위경도로 들고 바람 PNG를 쌍선형 보간해 이동하며, 이전 프레임을 서서히 지워 잔상을 만든다. 속도 구간별 색으로 그린다. 지도 이동·줌 중에는 숨기고, 끝나면 입자를 초기화한다. (WebGL GPGPU 방식보다 단순하고, 동아시아 범위·수천 개 입자로는 성능이 충분하다)
+- 풍속 배경: 같은 PNG로 풍속 색상 이미지를 만들어 MapLibre image source로 깐다. 위경도 격자를 그대로 펴면 메르카토르에서 위도가 최대 약 2° 어긋나므로, 행을 메르카토르 y 등간격으로 다시 샘플링한다.
 - 시간 슬라이더로 프레임을 바꾼다. 처음에는 현재 시각에 가장 가까운 프레임을 고른다.
 
 ## 화면
@@ -144,13 +149,13 @@ weather-app/                 pnpm workspace
 | 기상청 `resultCode≠00` / 네트워크 오류 / 10초 타임아웃 | 해당 섹션 `errors.*`에 사용자용 문구, 만료 캐시가 있으면 `stale: true`로 대체 |
 | `03 NODATA` | 직전 발표시각으로 1회 재시도 |
 | 바람 `latest.json` 없음·오류 | 바람 레이어와 슬라이더를 숨기고 "바람 데이터 준비 중" 표시, 나머지 기능은 정상 |
-| 바람 데이터가 12시간 넘게 오래됨 | 슬라이더에 기준 사이클 시각과 "업데이트 지연" 표시 |
+| 바람 데이터 사이클이 14시간 넘게 오래됨 (정상 운영에서도 공개 지연 때문에 최대 약 11.5시간) | 슬라이더에 기준 사이클 시각과 "업데이트 지연" 표시 |
 | `KMA_SERVICE_KEY` 없음 | 서버 시작 시 경고 로그, `/api/forecast`는 503 |
 
 ## 테스트
 
 - vitest (server):
-  - 격자 변환 기준값, 왕복 변환
+  - 격자 변환 기준값 (가이드 예시, 엑셀의 서울특별시 행)
   - 발표시각 계산(정시 직전·직후, 자정, 중기 06/18 경계)
   - 단기·중기 응답 파싱(범주값, 결측값)
   - 지역코드 매핑(서울, 강릉=영동, 춘천=영서, 제주, 바다 위 좌표)
